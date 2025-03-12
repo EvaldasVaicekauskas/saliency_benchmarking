@@ -1,36 +1,106 @@
 import pysaliency
 import numpy as np
 import os
+import cv2
 import argparse
 
-def load_fixations(fixation_path):
-    """Load fixation data from a directory (example)."""
-    return pysaliency.FixationTrains.from_matlab_files([fixation_path])
 
-def evaluate_saliency(saliency_dir, fixations_dir):
-    """Compute saliency evaluation metrics using pysaliency."""
-    print("Loading fixation data...")
-    fixations = load_fixations(os.path.join(fixations_dir, "fixations.mat"))
+def load_ground_truth_saliency(gt_dir):
+    """Load ground truth saliency maps as normalized grayscale images."""
+    gt_maps = {}
 
-    print("Evaluating saliency maps...")
-    for filename in os.listdir(saliency_dir):
-        if filename.endswith(".png") or filename.endswith(".jpg"):
-            saliency_map = pysaliency.SaliencyMapModel(
-                lambda _: np.array(pysaliency.load_image(os.path.join(saliency_dir, filename)))
-            )
+    for filename in sorted(os.listdir(gt_dir)):
+        if filename.endswith(('.png', '.jpg', '.jpeg')):
+            gt_map = cv2.imread(os.path.join(gt_dir, filename), cv2.IMREAD_GRAYSCALE)
+            if gt_map is None:
+                print(f"⚠️ Warning: Could not read ground truth map {filename}")
+                continue
 
-            # Compute standard saliency metrics
-            auc_judd = pysaliency.AUCJudd(saliency_map, fixations)
-            nss = pysaliency.NSS(saliency_map, fixations)
-            cc = pysaliency.CC(saliency_map, fixations)
+            # Normalize to range [0, 1]
+            gt_map = gt_map.astype(np.float32) / 255.0
+            gt_maps[filename] = gt_map
 
-            print(f"Results for {filename}:")
-            print(f"AUC-Judd: {auc_judd}, NSS: {nss}, CC: {cc}")
+    return gt_maps
+
+
+class SaliencyMapModel(pysaliency.Model):
+    """Custom Pysaliency model to wrap predicted saliency maps for evaluation."""
+
+    def __init__(self, saliency_maps):
+        super().__init__()
+        self.saliency_maps = saliency_maps  # Dictionary of saliency maps
+
+    def _log_density(self, stimulus):
+        """Compute log density of the saliency map for the given stimulus."""
+        if stimulus not in self.saliency_maps:
+            raise ValueError(f"Stimulus {stimulus} not found in saliency maps!")
+        saliency_map = self.saliency_maps[stimulus]
+
+        # Ensure saliency map is properly normalized
+        saliency_map = saliency_map.astype(np.float32) + 1e-9  # Avoid log(0)
+        saliency_map /= saliency_map.sum()  # Normalize to sum=1
+
+        return np.log(saliency_map)
+
+
+def evaluate_saliency(saliency_dir, gt_dir):
+    """Evaluate predicted saliency maps against ground truth saliency maps."""
+    print("📂 Loading ground truth saliency maps...")
+    gt_maps = load_ground_truth_saliency(gt_dir)
+
+    if not gt_maps:
+        print("❌ No valid ground truth data found!")
+        return
+
+    print("📊 Evaluating saliency maps...")
+    saliency_maps = {}
+
+    for filename in sorted(os.listdir(saliency_dir)):
+        if filename.startswith("saliency_"):
+            gt_filename = filename.replace("saliency_", "", 1)  # Remove prefix
+        else:
+            gt_filename = filename  # Use filename as is
+
+        if gt_filename not in gt_maps:
+            print(f"⚠️ No matching ground truth for {filename} → Looking for {gt_filename}, skipping...")
+            continue
+
+        print(f"🔍 Processing: {filename} (Matching GT: {gt_filename})")
+
+        pred_map = cv2.imread(os.path.join(saliency_dir, filename), cv2.IMREAD_GRAYSCALE)
+        if pred_map is None:
+            print(f"❌ Could not read predicted saliency map {filename}")
+            continue
+
+        # Normalize maps to [0,1]
+        pred_map = pred_map.astype(np.float32) / 255.0
+        saliency_maps[gt_filename] = pred_map  # Store with corrected filename
+
+    if not saliency_maps:
+        print("❌ No valid predicted saliency maps found!")
+        return
+
+    # Convert saliency maps to pysaliency Model
+    model = SaliencyMapModel(saliency_maps)
+
+    for filename in saliency_maps:
+        gt_map = gt_maps[filename]
+
+        # Compute evaluation metrics
+        cc = pysaliency.metrics.CC(gt_map, saliency_maps[filename])
+        sim = pysaliency.metrics.SIM(gt_map, saliency_maps[filename])
+        kl_div = pysaliency.metrics.MIT_KLDiv(gt_map, saliency_maps[filename])
+
+        print(f"✅ Results for {filename}:")
+        print(f"   📌 Correlation Coefficient (CC): {cc:.4f}")
+        print(f"   📌 Similarity Score (SIM): {sim:.4f}")
+        print(f"   📌 KL-Divergence: {kl_div:.4f}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate saliency maps.")
-    parser.add_argument("--saliency_dir", required=True, help="Path to saliency maps")
-    parser.add_argument("--fixations_dir", required=True, help="Path to ground truth fixations")
+    parser.add_argument("--saliency_dir", required=True, help="Path to the directory with predicted saliency maps")
+    parser.add_argument("--gt_dir", required=True, help="Path to the directory with ground truth saliency maps")
 
     args = parser.parse_args()
-    evaluate_saliency(args.saliency_dir, args.fixations_dir)
+    evaluate_saliency(args.saliency_dir, args.gt_dir)
